@@ -7,7 +7,7 @@ def openapi_tools_generator_bazel_repositories(
         sha256 = "f18d771e98f2c5bb169d1d1961de4f94866d2901abc1e16177dd7e9299834721",
         prefix = "openapi_tools_generator_bazel",
         server_urls = [
-            "https://repo1.maven.org/maven2"
+            "https://repo1.maven.org/maven2",
         ]):
     jvm_maven_import_external(
         name = "openapi_tools_generator_bazel_cli",
@@ -20,163 +20,67 @@ def openapi_tools_generator_bazel_repositories(
         actual = "@" + prefix + "_cli//jar",
     )
 
-def _comma_separated_pairs(pairs):
+def _create_comma_separated_pairs(pairs):
     return ",".join([
         "{}={}".format(k, v)
         for k, v in pairs.items()
     ])
 
-def _new_generator_command(ctx, declared_dir, rjars):
-    java_path = ctx.attr._jdk[java_common.JavaRuntimeInfo].java_executable_exec_path
-    gen_cmd = str(java_path)
-
-    jar_delimiter = ":"
-    if ctx.attr.is_windows:
-        jar_delimiter = ";"
-
-    jars = [ctx.file.openapi_generator_cli] + rjars.to_list()
-
-    gen_cmd += " -cp \"{jars}\" org.openapitools.codegen.OpenAPIGenerator generate -i {spec} -g {generator} -o {output}".format(
-        java = java_path,
-        jars = jar_delimiter.join([j.path for j in jars]),
-        spec = ctx.file.spec.path,
-        generator = ctx.attr.generator,
-        output = declared_dir.path,
-    )
-
-    gen_cmd += ' -p "{properties}"'.format(
-        properties = _comma_separated_pairs(ctx.attr.system_properties),
-    )
-
-    additional_properties = dict(ctx.attr.additional_properties)
-
-    # This is needed to ensure reproducible Java output
-    if ctx.attr.generator == "java" and \
-       "hideGenerationTimestamp" not in ctx.attr.additional_properties:
-        additional_properties["hideGenerationTimestamp"] = "true"
-
-    gen_cmd += ' --additional-properties "{properties}"'.format(
-        properties = _comma_separated_pairs(additional_properties),
-    )
-
-    gen_cmd += ' --type-mappings "{mappings}"'.format(
-        mappings = _comma_separated_pairs(ctx.attr.type_mappings),
-    )
-
-    gen_cmd += ' --reserved-words-mappings "{reserved_words_mappings}"'.format(
-        reserved_words_mappings = ",".join(ctx.attr.reserved_words_mappings),
-    )
-
-    if ctx.attr.config:
-        gen_cmd += " --config {config}".format(
-            config = ctx.attr.config.files.to_list()[0].path,
-        )
-    if ctx.attr.template_dir:
-        gen_cmd += " --template-dir {template_dir}".format(
-            template_dir = ctx.attr.template_dir.files.to_list()[0].path,
-        )
-
-    if ctx.attr.api_package:
-        gen_cmd += " --api-package {package}".format(
-            package = ctx.attr.api_package,
-        )
-    if ctx.attr.invoker_package:
-        gen_cmd += " --invoker-package {package}".format(
-            package = ctx.attr.invoker_package,
-        )
-    if ctx.attr.model_package:
-        gen_cmd += " --model-package {package}".format(
-            package = ctx.attr.model_package,
-        )
-    if ctx.attr.engine:
-        gen_cmd += " --engine {package}".format(
-            package = ctx.attr.engine,
-        )
-
-    # fixme: by default, openapi-generator is rather verbose. this helps with that but can also mask useful error messages
-    # when it fails. look into log configuration options. it's a java app so perhaps just a log4j.properties or something
-    gen_cmd += " 1>/dev/null"
-    return gen_cmd
-
-def _impl(ctx):
-    jars = _collect_jars(ctx.attr.deps)
-    (cjars, rjars) = (jars.compiletime, jars.runtime)
-
-    declared_dir = ctx.actions.declare_directory("%s" % (ctx.attr.name))
-
-    inputs = [
+def _openapi_generator_impl(ctx):
+    input_files = [
         ctx.file.openapi_generator_cli,
         ctx.file.spec,
-    ] + cjars.to_list() + rjars.to_list()
+        ctx.file.config,
+    ]
 
-    if ctx.attr.config:
-        inputs += ctx.attr.config.files.to_list()
+    output_files = [ctx.actions.declare_file(out) for out in ctx.attr.outs]
+    java_path = ctx.attr._jdk[java_common.JavaRuntimeInfo].java_executable_exec_path
 
-    if ctx.attr.template_dir:
-        inputs += ctx.attr.template_dir.files.to_list()
+    command_parts = [
+        java_path,
+        "-jar",
+        ctx.file.openapi_generator_cli.path,
+        "generate",
+        "-i",
+        ctx.file.spec.path,
+        "-g",
+        ctx.attr.generator,
+        "-o",
+        output_files[0].dirname,
+        "-p",
+        _create_comma_separated_pairs(ctx.attr.system_properties),
+        "--additional-properties",
+        _create_comma_separated_pairs(ctx.attr.additional_properties),
+        "--type-mappings",
+        _create_comma_separated_pairs(ctx.attr.type_mappings),
+        "--reserved-words-mappings",
+        ",".join(ctx.attr.reserved_words_mappings),
+        "--config",
+        ctx.file.config.path,
+    ]
 
-    # TODO: Convert to run
+    for attribute in ["template_dir", "api_package", "invoker_package", "model_package", "engine"]:
+        value = getattr(ctx.attr, attribute)
+        if value:
+            command_parts.extend(["--{}".format(attribute.replace("_", "-")), value])
+
+    command = " ".join(command_parts)
+
     ctx.actions.run_shell(
-        inputs = inputs,
-        command = "mkdir -p {gen_dir} && {generator_command}".format(
-            gen_dir = declared_dir.path,
-            generator_command = _new_generator_command(ctx, declared_dir, rjars),
-        ),
-        outputs = [declared_dir],
+        inputs = input_files,
+        outputs = output_files,
+        command = command,
         tools = ctx.files._jdk,
     )
 
-    srcs = declared_dir.path
-
-    return DefaultInfo(files = depset([
-        declared_dir,
-    ]))
-
-# taken from rules_scala
-def _collect_jars(targets):
-    """Compute the runtime and compile-time dependencies from the given targets"""  # noqa
-    compile_jars = depset()
-    runtime_jars = depset()
-    for target in targets:
-        found = False
-        if hasattr(target, "scala"):
-            if hasattr(target.scala.outputs, "ijar"):
-                compile_jars = depset(transitive = [compile_jars, [target.scala.outputs.ijar]])
-            compile_jars = depset(transitive = [compile_jars, target.scala.transitive_compile_exports])
-            runtime_jars = depset(transitive = [runtime_jars, target.scala.transitive_runtime_deps])
-            runtime_jars = depset(transitive = [runtime_jars, target.scala.transitive_runtime_exports])
-            found = True
-        if hasattr(target, "JavaInfo"):
-            # see JavaSkylarkApiProvider.java,
-            # this is just the compile-time deps
-            # this should be improved in bazel 0.1.5 to get outputs.ijar
-            # compile_jars = depset(transitive = [compile_jars, [target.java.outputs.ijar]])
-            compile_jars = depset(transitive = [compile_jars, target[JavaInfo].transitive_deps])
-            runtime_jars = depset(transitive = [runtime_jars, target[JavaInfo].transitive_runtime_deps])
-            found = True
-        if not found:
-            # support http_file pointed at a jar. http_jar uses ijar,
-            # which breaks scala macros
-            runtime_jars = depset(transitive = [runtime_jars, target.files])
-            compile_jars = depset(transitive = [compile_jars, target.files])
-
-    return struct(compiletime = compile_jars, runtime = runtime_jars)
+    return DefaultInfo(files = depset(output_files))
 
 _openapi_generator = rule(
     attrs = {
-        # downstream dependencies
         "deps": attr.label_list(allow_files = True),
-        # openapi spec file
-        "spec": attr.label(
-            mandatory = True,
-            allow_single_file = [
-                ".json",
-                ".yaml",
-                ".yml",
-            ],
-        ),
-        "template_dir": attr.label(allow_single_file = True),
-        "config": attr.label(allow_single_file = True),
+        "spec": attr.label(allow_single_file = [".json", ".yaml", ".yml"], mandatory = True),
+        "template_dir": attr.string(),
+        "config": attr.label(allow_single_file = [".yaml", ".yml"], mandatory = True),
         "generator": attr.string(mandatory = True),
         "api_package": attr.string(),
         "invoker_package": attr.string(),
@@ -186,26 +90,19 @@ _openapi_generator = rule(
         "engine": attr.string(),
         "type_mappings": attr.string_dict(),
         "reserved_words_mappings": attr.string_list(),
-        "is_windows": attr.bool(mandatory = True),
-        "_jdk": attr.label(
-            default = Label("@bazel_tools//tools/jdk:current_java_runtime"),
-            providers = [java_common.JavaRuntimeInfo],
-        ),
+        "outs": attr.string_list(mandatory = True),
+        "_jdk": attr.label(default = Label("@bazel_tools//tools/jdk:current_java_runtime"), providers = [java_common.JavaRuntimeInfo]),
         "openapi_generator_cli": attr.label(
             cfg = "host",
             default = Label("//external:openapi_tools_generator_bazel/dependency/openapi-generator-cli"),
             allow_single_file = True,
         ),
     },
-    implementation = _impl,
+    implementation = _openapi_generator_impl,
 )
 
 def openapi_generator(name, **kwargs):
     _openapi_generator(
         name = name,
-        is_windows = select({
-            "@bazel_tools//src/conditions:windows": True,
-            "//conditions:default": False,
-        }),
         **kwargs
     )
